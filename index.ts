@@ -15,38 +15,34 @@ if (!twitterApiKey) {
 
 // --- Agent Definition ---
 const agent = new Agent({
-  // Updated system prompt to reflect the new capability
-  systemPrompt: 'You are an agent designed to search for tweets using advanced query criteria (keywords, users, dates, etc.) via the twitterapi.io service. You can perform complex searches beyond just fetching a single user\'s timeline.',
+  systemPrompt: 'You are an agent designed to search for tweets using advanced query criteria (keywords, users, dates, etc.) via the twitter api. You can perform complex searches, including fetching subsequent pages of results using a cursor.',
   // apiKey: process.env.OPENSERV_API_KEY // SDK reads this automatically
 })
 
-// --- REMOVED OLD CAPABILITY ---
-// The fetchUserTweetsByUsername capability is no longer needed.
-
-// --- Add NEW Capability for Advanced Search ---
+// --- Add Capability for Advanced Search with Pagination ---
 agent.addCapability({
   name: 'advancedTweetSearch',
-  description: `Performs an advanced search for tweets based on a query string. Supports complex queries like keywords, hashtags, mentions, specific users (from:username), dates (since:YYYY-MM-DD, until:YYYY-MM-DD), etc. Returns the most recent matching tweets first (up to ~20 per call by default from the API). Refer to Twitter's advanced search syntax for constructing queries. Example queries: '"artificial intelligence" from:elonmusk since:2023-01-01', '#opensource OR #AI', 'search term -exclude_word'.`,
+  description: `Performs an advanced search for tweets based on a query string. Supports complex queries like keywords, hashtags, mentions, specific users (from:username), dates (since:YYYY-MM-DD, until:YYYY-MM-DD), etc. Returns the most recent matching tweets first (up to ~20 per call by default from the API). Supports pagination using a cursor. If more results are available, the output will include a 'next_cursor' value which can be provided in a subsequent call to retrieve the next page. Refer to Twitter's advanced search syntax for constructing queries. Example queries: '"artificial intelligence" from:elonmusk since:2023-01-01', '#opensource OR #AI', 'search term -exclude_word'.`,
   schema: z.object({
     query: z.string().describe(`The advanced search query string using Twitter's advanced search syntax (e.g., '"AI safety" from:openai', '#web3 since:2024-01-01', 'openserv.ai'). Required.`),
-    // queryType is required by the API, defaults to 'Latest'
-    queryType: z.enum(['Latest', 'Top']).default('Latest').describe('The type of search results to retrieve: "Latest" for most recent tweets, "Top" for most popular/relevant tweets. Defaults to "Latest".')
-    // We are omitting the 'cursor' for pagination in this basic version.
-    // The agent could potentially call this multiple times if needed,
-    // or pagination could be added later if required.
+    queryType: z.enum(['Latest', 'Top']).default('Latest').describe('The type of search results to retrieve: "Latest" for most recent tweets, "Top" for most popular/relevant tweets. Defaults to "Latest".'),
+    cursor: z.string().optional().describe('The cursor for pagination. Use the "next_cursor" value returned from a previous call to get the next page of results. Leave empty or omit for the first call/when not known.')
   }),
   async run({ args }) {
-    const { query, queryType } = args
+    // Destructure args including the optional cursor
+    const { query, queryType, cursor } = args
     const apiUrl = `${twitterApiBaseUrl}/twitter/tweet/advanced_search`
 
-    console.log(`Performing advanced search with query: "${query}", type: ${queryType} from ${apiUrl}`)
+    // Log the request details including the cursor
+    console.log(`Performing advanced search with query: "${query}", type: ${queryType}, cursor: "${cursor || '(first page)'}" from ${apiUrl}`)
 
     try {
       const response = await axios.get(apiUrl, {
         params: {
           query: query,
-          queryType: queryType
-          // cursor: '' // Start without a cursor for the first page
+          queryType: queryType,
+          // Include the cursor parameter. If it's undefined/null/empty, pass an empty string as per API docs for the first page.
+          cursor: cursor || ''
         },
         headers: {
           'X-API-Key': twitterApiKey,
@@ -57,29 +53,50 @@ agent.addCapability({
       // --- Handle API Response ---
       const responseData = response.data;
 
-      // Check specifically for the presence of the 'tweets' array in the success case for this endpoint
+      // Check specifically for the presence of the 'tweets' array
       if (!responseData || !Array.isArray(responseData.tweets)) {
-         // This API endpoint doesn't seem to have a 'status' field in the success response based on docs
          const errorMessage = responseData?.message || responseData?.msg || 'Unknown API error or invalid data structure (missing tweets array).';
          console.error(`API returned unexpected data structure for query "${query}":`, errorMessage, responseData);
          return `Error: Failed to fetch tweets. API Response: ${errorMessage}`;
       }
 
       const tweetsArray = responseData.tweets;
+      const hasNextPage = responseData.has_next_page; // Extract pagination info
+      const nextCursor = responseData.next_cursor;    // Extract next cursor
 
-      // Check if tweets array is empty
+      // Check if tweets array is empty for this specific page
       if (tweetsArray.length === 0) {
-        console.log(`No tweets found matching the query: "${query}".`);
-        return `No tweets found matching the search query: "${query}".`;
+        // If it's the first page (no cursor provided), it means no results at all.
+        // If it's a subsequent page, it just means this page is empty (end of results).
+        const message = cursor
+          ? `No more tweets found on this page for the query: "${query}".`
+          : `No tweets found matching the search query: "${query}".`;
+        console.log(message);
+        // Include pagination info even if no tweets on *this* page, as API might still report next page (though unlikely)
+        let output = message;
+        if (hasNextPage && nextCursor) {
+            output += `\n*Note: The API indicates more results might exist. Use this cursor for the next page: ${nextCursor}*`;
+        } else {
+            output += `\n*Note: End of results.*`;
+        }
+        return output;
       }
 
       // --- Format the Output ---
-      // Determine a relevant title - using the query itself is often best
       let output = `**Search Results for Query "${query}" (Type: ${queryType}):**\n\n`;
+      // Add note about which page this is if a cursor was used
+      if (cursor) {
+          output = `**Search Results for Query "${query}" (Type: ${queryType}) - Page corresponding to cursor "${cursor.substring(0,10)}...":**\n\n`;
+      } else {
+          output = `**Search Results for Query "${query}" (Type: ${queryType}) - First Page:**\n\n`;
+      }
+
 
       tweetsArray.forEach((tweet: any, index: number) => {
         const authorUsername = tweet.author?.userName || 'Unknown User';
-        const tweetText = (tweet.text || '').substring(0, 250) + ( (tweet.text || '').length > 250 ? '...' : ''); // Truncate for brevity
+        // Ensure text exists before trying to access length or substring
+        const tweetTextContent = tweet.text || '';
+        const tweetText = tweetTextContent.substring(0, 250) + (tweetTextContent.length > 250 ? '...' : ''); // Truncate for brevity
         output += `${index + 1}. **Author:** @${authorUsername}\n`;
         output += `   **ID:** ${tweet.id}\n`;
         output += `   **Text:** ${tweetText}\n`;
@@ -88,15 +105,17 @@ agent.addCapability({
         output += `   **Stats:** Likes: ${tweet.likeCount || 0}, Retweets: ${tweet.retweetCount || 0}, Replies: ${tweet.replyCount || 0}, Views: ${tweet.viewCount || 0}\n\n`;
       });
 
-       // Add pagination info if available (though we don't use the cursor yet)
-       if (responseData.has_next_page && responseData.next_cursor) {
-         output += `*Note: More results may be available (API indicates next page exists).*\n`;
+       // --- Add pagination information to the output ---
+       if (hasNextPage && nextCursor) {
+         output += `\n*Note: More results available. Use this cursor for the next page: ${nextCursor}*\n`;
+       } else {
+         output += `\n*Note: End of results.*\n`;
        }
 
       const estimatedTokens = Math.ceil(output.length / 4);
       console.log(`Returning output with estimated ${estimatedTokens} tokens.`);
 
-      // Keep total output limit check as safeguard for platform operation
+      // Keep total output limit check as safeguard
       const maxTotalOutputLength = 25000;
       if (output.length > maxTotalOutputLength) {
           console.warn(`Total output length ${output.length} exceeds safety limit ${maxTotalOutputLength}. Truncating further.`);
@@ -106,7 +125,7 @@ agent.addCapability({
       return output;
 
     } catch (error: any) {
-      console.error(`Error performing advanced search for query "${query}":`, error);
+      console.error(`Error performing advanced search for query "${query}" with cursor "${cursor || ''}":`, error);
 
       // --- Handle HTTP/Network Errors ---
       if (axios.isAxiosError(error)) {
@@ -115,11 +134,10 @@ agent.addCapability({
         if (status === 401 || status === 403) {
           return `Error: Authentication failed. Please check if the TWITTER_API_IO_KEY is correct and valid. (Status: ${status})`;
         } else if (status === 400) {
-            // 400 Bad Request often indicates an issue with the query syntax
-           return `Error: Bad request. The search query "${query}" might be invalid or improperly formatted. Please check the query syntax. (Status: 400, Message: ${apiMessage})`;
+           // This could be an invalid query OR an invalid cursor
+           const potentialReason = cursor ? `The search query "${query}" or the provided cursor might be invalid.` : `The search query "${query}" might be invalid or improperly formatted.`;
+           return `Error: Bad request. ${potentialReason} Please check the query syntax and cursor value. (Status: 400, Message: ${apiMessage})`;
         } else if (status === 404) {
-            // While 404 usually means 'Not Found', in an API context it might be used differently.
-            // However, the API docs suggest an empty array for no results, so a 404 might be a genuine endpoint issue.
            return `Error: API endpoint not found or unavailable. Please check the API configuration. (Status: 404)`;
         } else if (status === 429) {
           return `Error: API rate limit exceeded. Please wait and try again later. (Status: ${status})`;
@@ -138,6 +156,8 @@ agent.start()
   .then(() => {
     const port = process.env.PORT || 7378;
     console.log(`Twitter Advanced Search Agent server started. Listening for requests on port ${port}`);
+    console.log(`Agent ID: ${agent.agentId}`); // Log Agent ID for easy identification
+    console.log('Capabilities:', agent.getCapabilities().map(c => c.name));
   })
   .catch(error => {
     console.error('Error starting agent server:', error)
